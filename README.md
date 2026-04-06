@@ -1,6 +1,8 @@
 # Yu-Gi-Oh! Collection Query Tool
 
-A read-only CLI tool for querying Yu-Gi-Oh! card collection data.
+A **read-only CLI tool** specifically built for [OpenYugi](https://github.com/DJ-Cat-N-Cheese/Yu-Gi-Oh-Card-Tracker), the open-source Yu-Gi-Oh! card collection tracker.
+
+Designed for use with the [Yu-Gi-Oh! Card Tracker](https://github.com/DJ-Cat-N-Cheese/Yu-Gi-Oh-Card-Tracker) application.
 
 ## Features
 
