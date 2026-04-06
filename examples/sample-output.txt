@@ -1,0 +1,37 @@
+$ python3 query_collection.py summary
+Collection: Main
+Card records: 5260
+Unique card names: 5260
+Resolved card IDs: 5260
+Unique variants: 7874
+Entry rows: 9395
+Total copies: 11277
+
+Top cards by copies:
+- Polymerization: 24
+- Preparation of Rites: 20
+- Book of Moon: 19
+- Blue-Eyes White Dragon: 17
+- Cosmic Cyclone: 16
+
+$ python3 query_collection.py decks --limit 3
+ABC 2017 (1) | file=ABC 2017 (1).ydk | main=42 | extra=15 | side=0 | total=57
+ABC 2017 | file=ABC 2017.ydk | main=42 | extra=15 | side=0 | total=57
+ABC-D-Z | file=ABC-D-Z.ydk | main=50 | extra=15 | side=0 | total=65
+
+$ python3 query_collection.py movements --limit 3
+2026-04-03T13:29:34.427729+00:00 | REMOVE | Traptrix Mantis | qty=1 | file=scan_temp.log | set=SDBT-EN045
+2026-04-03T13:29:16.603726+00:00 | ADD | Hamon, Lord of Striking Thunder | qty=1 | file=scan_temp.log | set=SGX3-ENG02
+2026-04-03T13:28:12.865131+00:00 | ADD | Traptrix Mantis | qty=1 | file=scan_temp.log | set=SDBT-EN045
+
+$ python3 query_collection.py details --quantity 3 --limit 2
+A Hero Emerges | qty=3 | card_id=21597117 | type=Trap Card | Normal
+  owned sets: DP1-DE025, IOC-EN104, SGX1-ENA19
+  owned rarities: Common
+  prices: TCGPlayer 0.11, Cardmarket 0.05
+  effect: When an opponent's monster declares an attack: Your opponent chooses 1 random card from your hand, then if it is a monster that can be Special Summoned, Special Summon it. Otherwise, send it to the Graveyard.
+A-Assault Core | qty=3 | card_id=30012506 | type=Union Effect Monster | LIGHT | Machine | Level 4 | ATK 1900 | DEF 200
+  archetype: ABC
+  owned sets: LCKC-EN019
+  owned rarities: Secret Rare
+  prices: TCGPlayer 0.65, Cardmarket 0.09

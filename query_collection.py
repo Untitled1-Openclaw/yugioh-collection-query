@@ -20,14 +20,16 @@ from typing import Any
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
 TRACKER_ROOT = Path("/home/username1/Yu-Gi-Oh-Card-Tracker")
-DEFAULT_COLLECTION = WORKSPACE_ROOT / "collections" / "Main.json"
+DEFAULT_COLLECTION = TRACKER_ROOT / "data" / "collections" / "Main.json"
 DEFAULT_CARD_DB = TRACKER_ROOT / "data" / "db" / "card_db.json"
+DEFAULT_DECKS_DIR = TRACKER_ROOT / "data" / "decks"
 DEFAULT_TRANSACTIONS = TRACKER_ROOT / "data" / "transactions"
 FALLBACK_TRANSACTION_ROOTS = (
     TRACKER_ROOT / "data" / "transactions",
     TRACKER_ROOT / "data" / "changelogs",
 )
 TRANSACTION_SUFFIXES = {".json", ".log", ".ndjson"}
+DECK_SUFFIX = ".ydk"
 
 
 def load_json(path: Path) -> Any:
@@ -86,11 +88,23 @@ def build_card_indexes(card_db: list[dict[str, Any]]) -> dict[str, Any]:
     by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_variant: dict[str, dict[str, Any]] = {}
     by_set_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_image_id: dict[int, dict[str, Any]] = {}
+    alt_art_map: dict[int, int] = {}
 
     for record in card_db:
         card_id = record.get("id")
         if isinstance(card_id, int):
             by_id[card_id] = record
+
+        for image in record.get("card_images") or []:
+            if not isinstance(image, dict):
+                continue
+            image_id = image.get("id")
+            if not isinstance(image_id, int):
+                continue
+            by_image_id[image_id] = record
+            if isinstance(card_id, int) and image_id != card_id:
+                alt_art_map[image_id] = card_id
 
         name_key = normalize_text(record.get("name"))
         if name_key:
@@ -111,7 +125,25 @@ def build_card_indexes(card_db: list[dict[str, Any]]) -> dict[str, Any]:
         "by_name": by_name,
         "by_variant": by_variant,
         "by_set_code": by_set_code,
+        "by_image_id": by_image_id,
+        "alt_art_map": alt_art_map,
     }
+
+
+def resolve_deck_card(
+    deck_card_id: int,
+    indexes: dict[str, Any],
+) -> tuple[dict[str, Any] | None, int | None, bool]:
+    record = indexes["by_id"].get(deck_card_id)
+    if record is not None:
+        return record, deck_card_id, False
+
+    record = indexes["by_image_id"].get(deck_card_id)
+    if record is None:
+        return None, None, False
+
+    base_id = record.get("id")
+    return record, base_id if isinstance(base_id, int) else None, True
 
 
 def resolve_card_record(
@@ -206,11 +238,11 @@ def text_match(value: Any, expected: str | None, exact: bool) -> bool:
 
 
 def quantity_match(total: int, args: argparse.Namespace) -> bool:
-    if args.quantity is not None and total != args.quantity:
+    if getattr(args, "quantity", None) is not None and total != args.quantity:
         return False
-    if args.min_quantity is not None and total < args.min_quantity:
+    if getattr(args, "min_quantity", None) is not None and total < args.min_quantity:
         return False
-    if args.max_quantity is not None and total > args.max_quantity:
+    if getattr(args, "max_quantity", None) is not None and total > args.max_quantity:
         return False
     return True
 
@@ -219,21 +251,24 @@ def filter_rows(rows: list[dict[str, Any]], args: argparse.Namespace) -> list[di
     filtered: list[dict[str, Any]] = []
     for row in rows:
         resolved_card_id = row.get("resolved_card_id", row.get("card_id"))
-        if args.card_id is not None and resolved_card_id != args.card_id and row["card_id"] != args.card_id:
+        card_id_filter = getattr(args, "card_id", None)
+        if card_id_filter is not None and resolved_card_id != card_id_filter and row["card_id"] != card_id_filter:
             continue
-        if not text_match(row["name"], args.name, args.exact):
+        exact = bool(getattr(args, "exact", False))
+        if not text_match(row["name"], getattr(args, "name", None), exact):
             continue
-        if not text_match(row["set_code"], args.set_code, args.exact):
+        if not text_match(row["set_code"], getattr(args, "set_code", None), exact):
             continue
-        if not text_match(row["rarity"], args.rarity, args.exact):
+        if not text_match(row["rarity"], getattr(args, "rarity", None), exact):
             continue
-        if not text_match(row["condition"], args.condition, args.exact):
+        if not text_match(row["condition"], getattr(args, "condition", None), exact):
             continue
-        if not text_match(row["language"], args.language, args.exact):
+        if not text_match(row["language"], getattr(args, "language", None), exact):
             continue
-        if not text_match(row["storage_location"], args.storage_location, args.exact):
+        if not text_match(row["storage_location"], getattr(args, "storage_location", None), exact):
             continue
-        if args.first_edition is not None and row["first_edition"] != args.first_edition:
+        first_edition = getattr(args, "first_edition", None)
+        if first_edition is not None and row["first_edition"] != first_edition:
             continue
         filtered.append(row)
     return filtered
@@ -536,6 +571,193 @@ def build_card_details(cards: list[dict[str, Any]], card_indexes: dict[str, Any]
     return sorted(details, key=lambda item: (-item["owned_quantity"], item["name"]))
 
 
+def build_owned_quantity_map(cards: list[dict[str, Any]]) -> dict[int, int]:
+    owned_map: dict[int, int] = {}
+    for card in cards:
+        resolved_card_id = card.get("resolved_card_id")
+        if isinstance(resolved_card_id, int):
+            owned_map[resolved_card_id] = card["total_quantity"]
+    return owned_map
+
+
+def discover_deck_files(path: Path) -> list[Path]:
+    if path.is_file() and path.suffix.lower() == DECK_SUFFIX:
+        return [path]
+    if not path.exists() or not path.is_dir():
+        return []
+    return sorted(candidate for candidate in path.rglob(f"*{DECK_SUFFIX}") if candidate.is_file())
+
+
+def parse_ydk_file(path: Path) -> dict[str, Any]:
+    deck = {
+        "name": path.stem,
+        "filename": path.name,
+        "path": str(path),
+        "main": [],
+        "extra": [],
+        "side": [],
+    }
+    current_section = "main"
+
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                lowered = line.lower()
+                if "main" in lowered:
+                    current_section = "main"
+                elif "extra" in lowered:
+                    current_section = "extra"
+                elif "side" in lowered:
+                    current_section = "side"
+                continue
+            if line.startswith("!"):
+                if "side" in line.lower():
+                    current_section = "side"
+                continue
+            if not line.isdigit():
+                continue
+            deck[current_section].append(int(line))
+
+    return deck
+
+
+def list_decks(path: Path) -> list[dict[str, Any]]:
+    decks = []
+    for deck_path in discover_deck_files(path):
+        parsed = parse_ydk_file(deck_path)
+        decks.append(
+            {
+                "name": parsed["name"],
+                "filename": parsed["filename"],
+                "path": parsed["path"],
+                "main_count": len(parsed["main"]),
+                "extra_count": len(parsed["extra"]),
+                "side_count": len(parsed["side"]),
+                "total_count": len(parsed["main"]) + len(parsed["extra"]) + len(parsed["side"]),
+            }
+        )
+    return decks
+
+
+def resolve_deck_name(decks: list[dict[str, Any]], target: str) -> dict[str, Any]:
+    normalized_target = normalize_text(target)
+    exact_matches = [
+        deck
+        for deck in decks
+        if normalize_text(deck["name"]) == normalized_target
+        or normalize_text(deck["filename"]) == normalized_target
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        matches = ", ".join(deck["filename"] for deck in exact_matches[:10])
+        raise ValueError(f"Deck name is ambiguous: {matches}")
+
+    fuzzy_matches = [
+        deck
+        for deck in decks
+        if normalized_target in normalize_text(deck["name"])
+        or normalized_target in normalize_text(deck["filename"])
+    ]
+    if len(fuzzy_matches) == 1:
+        return fuzzy_matches[0]
+    if not fuzzy_matches:
+        raise FileNotFoundError(f"No deck matched: {target}")
+
+    matches = ", ".join(deck["filename"] for deck in fuzzy_matches[:10])
+    raise ValueError(f"Deck name is ambiguous: {matches}")
+
+
+def summarize_deck_section(
+    section_name: str,
+    card_ids: list[int],
+    card_indexes: dict[str, Any],
+    owned_map: dict[int, int],
+) -> tuple[list[dict[str, Any]], Counter[int]]:
+    grouped: dict[int, dict[str, Any]] = {}
+    base_requirements: Counter[int] = Counter()
+
+    for deck_card_id in card_ids:
+        record, base_id, is_alt_art = resolve_deck_card(deck_card_id, card_indexes)
+        key = deck_card_id
+        item = grouped.setdefault(
+            key,
+            {
+                "section": section_name,
+                "deck_card_id": deck_card_id,
+                "resolved_card_id": base_id,
+                "name": record.get("name") if record else None,
+                "known": record is not None,
+                "is_alt_art": is_alt_art,
+                "artstyle_offset": deck_card_id - base_id if is_alt_art and isinstance(base_id, int) else 0,
+                "quantity": 0,
+                "owned_quantity": owned_map.get(base_id, 0) if isinstance(base_id, int) else 0,
+                "type": record.get("type") if record else None,
+            },
+        )
+        item["quantity"] += 1
+        if isinstance(base_id, int):
+            base_requirements[base_id] += 1
+
+    rows = sorted(
+        grouped.values(),
+        key=lambda item: (
+            item["name"] is None,
+            normalize_text(item["name"] or str(item["deck_card_id"])),
+            item["deck_card_id"],
+        ),
+    )
+    return rows, base_requirements
+
+
+def build_deck_report(
+    deck: dict[str, Any],
+    card_indexes: dict[str, Any],
+    owned_map: dict[int, int],
+) -> dict[str, Any]:
+    sections: dict[str, list[dict[str, Any]]] = {}
+    required_by_base: Counter[int] = Counter()
+    unknown_ids: list[int] = []
+
+    for section_name in ("main", "extra", "side"):
+        rows, requirements = summarize_deck_section(section_name, deck[section_name], card_indexes, owned_map)
+        sections[section_name] = rows
+        required_by_base.update(requirements)
+        unknown_ids.extend(item["deck_card_id"] for item in rows if not item["known"])
+
+    missing_cards: list[dict[str, Any]] = []
+    for base_id, required_quantity in sorted(required_by_base.items(), key=lambda item: (-item[1], item[0])):
+        record = card_indexes["by_id"].get(base_id)
+        owned_quantity = owned_map.get(base_id, 0)
+        if owned_quantity >= required_quantity:
+            continue
+        missing_cards.append(
+            {
+                "card_id": base_id,
+                "name": record.get("name") if record else None,
+                "required_quantity": required_quantity,
+                "owned_quantity": owned_quantity,
+                "missing_quantity": required_quantity - owned_quantity,
+            }
+        )
+
+    return {
+        "name": deck["name"],
+        "filename": deck["filename"],
+        "path": deck["path"],
+        "main_count": len(deck["main"]),
+        "extra_count": len(deck["extra"]),
+        "side_count": len(deck["side"]),
+        "total_count": len(deck["main"]) + len(deck["extra"]) + len(deck["side"]),
+        "sections": sections,
+        "unknown_ids": sorted(set(unknown_ids)),
+        "missing_cards": missing_cards,
+    }
+
+
 def render_summary(summary: dict[str, Any]) -> str:
     lines = [
         f"Collection: {summary['collection_name']}",
@@ -700,6 +922,67 @@ def render_movement_summary(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_deck_list(decks: list[dict[str, Any]], limit: int | None) -> str:
+    if limit is not None:
+        decks = decks[:limit]
+    if not decks:
+        return "No decks found."
+    return "\n".join(
+        f"{deck['name']} | file={deck['filename']} | main={deck['main_count']} | "
+        f"extra={deck['extra_count']} | side={deck['side_count']} | total={deck['total_count']}"
+        for deck in decks
+    )
+
+
+def render_deck_report(report: dict[str, Any]) -> str:
+    lines = [
+        f"Deck: {report['name']}",
+        f"File: {report['filename']}",
+        f"Main: {report['main_count']} | Extra: {report['extra_count']} | Side: {report['side_count']} | Total: {report['total_count']}",
+    ]
+
+    if report["unknown_ids"]:
+        lines.append(f"Unknown IDs: {', '.join(str(card_id) for card_id in report['unknown_ids'])}")
+
+    if report["missing_cards"]:
+        missing_total = sum(item["missing_quantity"] for item in report["missing_cards"])
+        lines.append(f"Missing owned copies: {missing_total}")
+    else:
+        lines.append("Missing owned copies: 0")
+
+    for section_name in ("main", "extra", "side"):
+        rows = report["sections"][section_name]
+        lines.append("")
+        lines.append(f"{section_name.title()} Deck:")
+        if not rows:
+            lines.append("- empty")
+            continue
+        for item in rows:
+            if not item["known"]:
+                lines.append(f"- {item['quantity']}x UNKNOWN | deck_id={item['deck_card_id']}")
+                continue
+            art_label = ""
+            if item["is_alt_art"]:
+                offset = item["artstyle_offset"]
+                art_label = f" | art=alt({offset:+d})" if offset else " | art=alt"
+            lines.append(
+                f"- {item['quantity']}x {item['name']} | deck_id={item['deck_card_id']} | "
+                f"base_id={item['resolved_card_id']} | owned={item['owned_quantity']}{art_label}"
+            )
+
+    if report["missing_cards"]:
+        lines.append("")
+        lines.append("Missing from collection:")
+        for item in report["missing_cards"]:
+            label = item["name"] or f"card_id={item['card_id']}"
+            lines.append(
+                f"- {label} | card_id={item['card_id']} | required={item['required_quantity']} | "
+                f"owned={item['owned_quantity']} | missing={item['missing_quantity']}"
+            )
+
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -720,22 +1003,31 @@ def build_parser() -> argparse.ArgumentParser:
             "the tool falls back to tracker changelogs."
         ),
     )
+    parser.add_argument(
+        "--decks-dir",
+        default=str(DEFAULT_DECKS_DIR),
+        help=f"Path to deck directory/file (default: {DEFAULT_DECKS_DIR})",
+    )
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     summary_parser = subparsers.add_parser("summary", help="Show collection summary statistics")
+    add_json_flag(summary_parser)
     add_filters(summary_parser)
 
     cards_parser = subparsers.add_parser("cards", help="List cards and total copies")
+    add_json_flag(cards_parser)
     add_filters(cards_parser)
     cards_parser.add_argument("--limit", type=int, default=50, help="Maximum results to show")
 
     entries_parser = subparsers.add_parser("entries", help="List matching inventory entries")
+    add_json_flag(entries_parser)
     add_filters(entries_parser)
     entries_parser.add_argument("--limit", type=int, default=50, help="Maximum results to show")
 
     resolve_parser = subparsers.add_parser("resolve", help="Resolve collection cards against card_db.json")
+    add_json_flag(resolve_parser)
     add_filters(resolve_parser)
     add_quantity_filters(resolve_parser)
     resolve_parser.add_argument("--limit", type=int, default=50, help="Maximum results to show")
@@ -744,6 +1036,7 @@ def build_parser() -> argparse.ArgumentParser:
         "details",
         help="Join owned cards with card_db.json details, including effects",
     )
+    add_json_flag(details_parser)
     add_filters(details_parser)
     add_quantity_filters(details_parser)
     details_parser.add_argument("--limit", type=int, default=20, help="Maximum results to show")
@@ -752,6 +1045,7 @@ def build_parser() -> argparse.ArgumentParser:
         "movements",
         help="Query card movement history from transaction/changelog files",
     )
+    add_json_flag(movements_parser)
     add_filters(movements_parser)
     movements_parser.add_argument("--limit", type=int, default=20, help="Maximum results to show")
     movements_parser.add_argument(
@@ -766,6 +1060,7 @@ def build_parser() -> argparse.ArgumentParser:
         "movement-summary",
         help="Summarize card movement history from transaction/changelog files",
     )
+    add_json_flag(movement_summary_parser)
     add_filters(movement_summary_parser)
     movement_summary_parser.add_argument(
         "--action",
@@ -774,6 +1069,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter by action(s)",
     )
     movement_summary_parser.add_argument("--source", help="Filter by source filename/path")
+
+    decks_parser = subparsers.add_parser("decks", help="List available .ydk decks")
+    add_json_flag(decks_parser)
+    decks_parser.add_argument("--limit", type=int, default=100, help="Maximum results to show")
+
+    deck_parser = subparsers.add_parser("deck", help="Show cards in a specific .ydk deck")
+    add_json_flag(deck_parser)
+    deck_parser.add_argument("deck_name", help="Deck name or filename to inspect")
 
     return parser
 
@@ -798,6 +1101,15 @@ def add_filters(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_json_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Emit JSON instead of text",
+    )
+
+
 def add_quantity_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quantity", type=int, help="Filter by exact owned quantity")
     parser.add_argument("--min-quantity", type=int, help="Filter by minimum owned quantity")
@@ -814,6 +1126,7 @@ def main() -> int:
     rows = flatten_entries(collection, card_indexes)
     filtered_rows = filter_rows(rows, args)
     aggregated_cards = aggregate_cards(filtered_rows)
+    owned_map = build_owned_quantity_map(aggregate_cards(rows))
 
     if args.command == "summary":
         payload = summarize(collection, filtered_rows)
@@ -863,6 +1176,22 @@ def main() -> int:
         else:
             payload = summarize_movements(filtered_transactions)
             print(json.dumps(payload, indent=2) if args.json else render_movement_summary(payload))
+        return 0
+
+    if args.command == "decks":
+        payload = list_decks(Path(args.decks_dir))
+        if args.json:
+            print(json.dumps(payload[: args.limit], indent=2))
+        else:
+            print(render_deck_list(payload, args.limit))
+        return 0
+
+    if args.command == "deck":
+        decks = list_decks(Path(args.decks_dir))
+        selected = resolve_deck_name(decks, args.deck_name)
+        deck_data = parse_ydk_file(Path(selected["path"]))
+        payload = build_deck_report(deck_data, card_indexes, owned_map)
+        print(json.dumps(payload, indent=2) if args.json else render_deck_report(payload))
         return 0
 
     parser.error(f"Unknown command: {args.command}")
