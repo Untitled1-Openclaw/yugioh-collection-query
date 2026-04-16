@@ -983,6 +983,308 @@ def render_deck_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ─── Set Info ────────────────────────────────────────────────────────────────
+
+def _set_code_matches_prefix(set_code: str | None, prefix_norm: str) -> bool:
+    if not set_code:
+        return False
+    sc_norm = normalize_text(set_code)
+    return sc_norm == prefix_norm or sc_norm.startswith(prefix_norm + "-")
+
+
+def build_set_report(
+    set_prefix: str,
+    card_db: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    owned_only: bool = False,
+) -> dict[str, Any]:
+    prefix_norm = normalize_text(set_prefix)
+
+    rows_by_id: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        rcid = row.get("resolved_card_id")
+        if isinstance(rcid, int):
+            rows_by_id[rcid].append(row)
+        cid = row.get("card_id")
+        if isinstance(cid, int) and cid != rcid:
+            rows_by_id[cid].append(row)
+
+    set_cards: list[dict[str, Any]] = []
+    for record in card_db:
+        matching_set_entries = [
+            cs for cs in (record.get("card_sets") or [])
+            if isinstance(cs, dict) and _set_code_matches_prefix(cs.get("set_code"), prefix_norm)
+        ]
+        if not matching_set_entries:
+            continue
+
+        card_id = record.get("id")
+        owned_rows = rows_by_id.get(card_id, []) if isinstance(card_id, int) else []
+        owned_qty = sum(r["quantity"] for r in owned_rows)
+
+        if owned_only and owned_qty == 0:
+            continue
+
+        variant_qty: defaultdict[tuple, int] = defaultdict(int)
+        for r in owned_rows:
+            variant_qty[(r.get("set_code"), r.get("rarity"))] += r["quantity"]
+        owned_variants = [
+            {"set_code": sc, "rarity": rar, "quantity": qty}
+            for (sc, rar), qty in sorted(variant_qty.items())
+            if qty > 0
+        ]
+
+        sorted_set_entries = sorted(
+            matching_set_entries,
+            key=lambda cs: normalize_text(cs.get("set_code", "")),
+        )
+        set_cards.append({
+            "card_id": card_id,
+            "name": record.get("name"),
+            "set_entries": [
+                {"set_code": cs.get("set_code"), "set_rarity": cs.get("set_rarity")}
+                for cs in sorted_set_entries
+            ],
+            "owned_quantity": owned_qty,
+            "owned_variants": owned_variants,
+        })
+
+    set_cards.sort(
+        key=lambda c: normalize_text(c["set_entries"][0]["set_code"] if c["set_entries"] else "")
+    )
+    owned_count = sum(1 for c in set_cards if c["owned_quantity"] > 0)
+    return {
+        "set_prefix": set_prefix,
+        "total_in_set": len(set_cards),
+        "owned_unique": owned_count,
+        "cards": set_cards,
+    }
+
+
+def render_set_report(report: dict[str, Any]) -> str:
+    lines = [
+        f"Set: {report['set_prefix']}",
+        f"Cards in set: {report['total_in_set']}",
+        f"Owned (unique cards): {report['owned_unique']} / {report['total_in_set']}",
+    ]
+    if not report["cards"]:
+        lines.append("No cards found for this set code.")
+        return "\n".join(lines)
+    lines.append("")
+    for card in report["cards"]:
+        set_codes = ", ".join(e["set_code"] for e in card["set_entries"] if e.get("set_code"))
+        rarities = ", ".join(e["set_rarity"] for e in card["set_entries"] if e.get("set_rarity"))
+        lines.append(
+            f"{card['name']} | card_id={card['card_id']} | owned={card['owned_quantity']} | "
+            f"{set_codes} | {rarities}"
+        )
+        for v in card["owned_variants"]:
+            lines.append(f"  -> {v['set_code']} {v['rarity']} x{v['quantity']}")
+    return "\n".join(lines)
+
+
+# ─── Storage Info ─────────────────────────────────────────────────────────────
+
+def discover_storage_locations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stats: defaultdict[Any, dict[str, int]] = defaultdict(lambda: {"entry_count": 0, "total_copies": 0})
+    for row in rows:
+        loc = row.get("storage_location")
+        stats[loc]["entry_count"] += 1
+        stats[loc]["total_copies"] += row.get("quantity", 0)
+    result = []
+    for loc, data in sorted(stats.items(), key=lambda x: (x[0] is None, (x[0] or "").casefold())):
+        result.append({
+            "storage_location": loc if loc is not None else "(unassigned)",
+            "entry_count": data["entry_count"],
+            "total_copies": data["total_copies"],
+        })
+    return result
+
+
+def build_storage_report(location: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    matching = [r for r in rows if text_match(r.get("storage_location"), location, False)]
+    card_totals: defaultdict[str, int] = defaultdict(int)
+    for r in matching:
+        card_totals[r["name"] or "(unknown)"] += r["quantity"]
+    return {
+        "storage_location": location,
+        "total_entry_rows": len(matching),
+        "total_copies": sum(r["quantity"] for r in matching),
+        "unique_card_names": len(card_totals),
+        "entries": matching,
+    }
+
+
+def render_storage_list(locations: list[dict[str, Any]]) -> str:
+    if not locations:
+        return "No storage locations found."
+    lines = [f"Storage locations ({len(locations)} total):"]
+    for loc in locations:
+        lines.append(
+            f"  {loc['storage_location']} | entries={loc['entry_count']} | copies={loc['total_copies']}"
+        )
+    return "\n".join(lines)
+
+
+def render_storage_report(report: dict[str, Any], limit: int | None) -> str:
+    lines = [
+        f"Storage: {report['storage_location']}",
+        f"Unique card names: {report['unique_card_names']}",
+        f"Entry rows: {report['total_entry_rows']}",
+        f"Total copies: {report['total_copies']}",
+        "",
+    ]
+    entries = report["entries"]
+    if limit is not None:
+        entries = entries[:limit]
+    if not entries:
+        lines.append("No entries found at this location.")
+    else:
+        for row in entries:
+            edition = "1st" if row["first_edition"] else "Unlimited/Other"
+            lines.append(
+                f"{row['name']} | qty={row['quantity']} | set={row['set_code']} | "
+                f"rarity={row['rarity']} | cond={row['condition']} | lang={row['language']} | {edition}"
+            )
+    return "\n".join(lines)
+
+
+# ─── Card Where ───────────────────────────────────────────────────────────────
+
+def build_where_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {"card_id": None, "name": None, "total_copies": 0, "locations": []}
+
+    first = rows[0]
+    loc_map: defaultdict[Any, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        loc_map[row.get("storage_location")].append(row)
+
+    locations = []
+    for loc, loc_rows in sorted(loc_map.items(), key=lambda x: (x[0] is None, (x[0] or "").casefold())):
+        locations.append({
+            "storage_location": loc if loc is not None else "(unassigned)",
+            "total_copies": sum(r["quantity"] for r in loc_rows),
+            "entries": loc_rows,
+        })
+
+    return {
+        "card_id": first.get("resolved_card_id") or first.get("card_id"),
+        "name": first.get("name"),
+        "total_copies": sum(r["quantity"] for r in rows),
+        "locations": locations,
+    }
+
+
+def render_where(report: dict[str, Any]) -> str:
+    if report["total_copies"] == 0:
+        name_label = report.get("name") or str(report.get("card_id") or "?")
+        return f"Card not found in collection: {name_label}"
+    lines = [
+        f"Card: {report['name']} | card_id={report['card_id']} | total_copies={report['total_copies']}",
+        "",
+    ]
+    for loc_entry in report["locations"]:
+        lines.append(f"  {loc_entry['storage_location']} ({loc_entry['total_copies']} copies)")
+        for row in loc_entry["entries"]:
+            edition = "1st" if row["first_edition"] else "Unlimited/Other"
+            lines.append(
+                f"    qty={row['quantity']} | {row['set_code']} | {row['rarity']} | "
+                f"{row['condition']} | {row['language']} | {edition}"
+            )
+    return "\n".join(lines)
+
+
+# ─── Deck Location Check ──────────────────────────────────────────────────────
+
+def build_deck_location_check(
+    deck: dict[str, Any],
+    card_indexes: dict[str, Any],
+    rows: list[dict[str, Any]],
+    location: str,
+) -> dict[str, Any]:
+    deck_cards: Counter[int] = Counter()
+    deck_names: dict[int, str | None] = {}
+    for section in ("main", "extra", "side"):
+        for deck_card_id in deck[section]:
+            record, base_id, _ = resolve_deck_card(deck_card_id, card_indexes)
+            if isinstance(base_id, int):
+                deck_cards[base_id] += 1
+                if base_id not in deck_names and record:
+                    deck_names[base_id] = record.get("name")
+
+    loc_rows = [r for r in rows if text_match(r.get("storage_location"), location, False)]
+    location_qty: defaultdict[int, int] = defaultdict(int)
+    for r in loc_rows:
+        rcid = r.get("resolved_card_id")
+        if isinstance(rcid, int):
+            location_qty[rcid] += r["quantity"]
+
+    total_owned_qty: defaultdict[int, int] = defaultdict(int)
+    for r in rows:
+        rcid = r.get("resolved_card_id")
+        if isinstance(rcid, int):
+            total_owned_qty[rcid] += r["quantity"]
+
+    results = []
+    in_location = 0
+    for base_id, required in sorted(deck_cards.items(), key=lambda x: -x[1]):
+        qty_at_loc = location_qty.get(base_id, 0)
+        total_owned = total_owned_qty.get(base_id, 0)
+        has_enough_here = qty_at_loc >= required
+        if has_enough_here:
+            in_location += 1
+        results.append({
+            "card_id": base_id,
+            "name": deck_names.get(base_id),
+            "required": required,
+            "qty_at_location": qty_at_loc,
+            "total_owned": total_owned,
+            "has_enough_here": has_enough_here,
+        })
+
+    total_unique = len(deck_cards)
+    return {
+        "deck_name": deck["name"],
+        "location": location,
+        "total_unique_cards": total_unique,
+        "in_location": in_location,
+        "not_in_location": total_unique - in_location,
+        "cards": sorted(
+            results,
+            key=lambda x: (not x["has_enough_here"], normalize_text(x["name"] or str(x["card_id"]))),
+        ),
+    }
+
+
+def render_deck_location_check(report: dict[str, Any]) -> str:
+    lines = [
+        f"Deck: {report['deck_name']}",
+        f"Location: {report['location']}",
+        f"Cards at location: {report['in_location']} / {report['total_unique_cards']} unique cards",
+        f"Cards elsewhere/missing: {report['not_in_location']}",
+    ]
+    in_loc = [c for c in report["cards"] if c["has_enough_here"]]
+    not_in_loc = [c for c in report["cards"] if not c["has_enough_here"]]
+
+    if in_loc:
+        lines.append("")
+        lines.append(f"In '{report['location']}' ({len(in_loc)} cards):")
+        for c in in_loc:
+            lines.append(
+                f"  {c['name']} | need={c['required']} | at_location={c['qty_at_location']} | total_owned={c['total_owned']}"
+            )
+    if not_in_loc:
+        lines.append("")
+        lines.append(f"Not at '{report['location']}' ({len(not_in_loc)} cards):")
+        for c in not_in_loc:
+            name_label = c["name"] or f"card_id={c['card_id']}"
+            lines.append(
+                f"  {name_label} | need={c['required']} | at_location={c['qty_at_location']} | total_owned={c['total_owned']}"
+            )
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1077,6 +1379,59 @@ def build_parser() -> argparse.ArgumentParser:
     deck_parser = subparsers.add_parser("deck", help="Show cards in a specific .ydk deck")
     add_json_flag(deck_parser)
     deck_parser.add_argument("deck_name", help="Deck name or filename to inspect")
+    deck_parser.add_argument(
+        "--location",
+        help="Check how many deck cards are present at a specific storage location",
+    )
+
+    set_parser = subparsers.add_parser(
+        "set",
+        help="Show all cards in a set and how many you own",
+    )
+    add_json_flag(set_parser)
+    set_parser.add_argument("set_code", help="Set code prefix (e.g. MP21, LOB, BLCR, RA02)")
+    set_parser.add_argument(
+        "--owned-only",
+        action="store_true",
+        help="Only show cards you own at least 1 copy of",
+    )
+
+    storage_parser = subparsers.add_parser(
+        "storage",
+        help="Browse cards by storage location; omit location to list all locations",
+    )
+    add_json_flag(storage_parser)
+    storage_parser.add_argument(
+        "location",
+        nargs="?",
+        help="Storage location name to inspect (omit to list all locations)",
+    )
+    storage_parser.add_argument("--name", help="Filter entries by card name")
+    storage_parser.add_argument("--card-id", type=int, help="Filter entries by card ID")
+    storage_parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="Use exact matching instead of case-insensitive substring matching",
+    )
+    storage_parser.add_argument("--limit", type=int, default=100, help="Maximum entries to show")
+
+    where_parser = subparsers.add_parser(
+        "where",
+        help="Find all storage locations for a card",
+    )
+    add_json_flag(where_parser)
+    where_parser.add_argument(
+        "card_name",
+        nargs="?",
+        help="Card name to look up (or use --name / --card-id)",
+    )
+    where_parser.add_argument("--name", help="Card name to look up")
+    where_parser.add_argument("--card-id", type=int, help="Card ID to look up")
+    where_parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="Use exact name matching",
+    )
 
     return parser
 
@@ -1190,8 +1545,67 @@ def main() -> int:
         decks = list_decks(Path(args.decks_dir))
         selected = resolve_deck_name(decks, args.deck_name)
         deck_data = parse_ydk_file(Path(selected["path"]))
-        payload = build_deck_report(deck_data, card_indexes, owned_map)
-        print(json.dumps(payload, indent=2) if args.json else render_deck_report(payload))
+        location = getattr(args, "location", None)
+        if location:
+            payload = build_deck_location_check(deck_data, card_indexes, rows, location)
+            print(json.dumps(payload, indent=2) if args.json else render_deck_location_check(payload))
+        else:
+            payload = build_deck_report(deck_data, card_indexes, owned_map)
+            print(json.dumps(payload, indent=2) if args.json else render_deck_report(payload))
+        return 0
+
+    if args.command == "set":
+        payload = build_set_report(args.set_code, card_db, rows, owned_only=args.owned_only)
+        print(json.dumps(payload, indent=2) if args.json else render_set_report(payload))
+        return 0
+
+    if args.command == "storage":
+        if not args.location:
+            locations = discover_storage_locations(rows)
+            print(json.dumps(locations, indent=2) if args.json else render_storage_list(locations))
+        else:
+            # Apply optional name/card-id filters on top of location filter
+            storage_filtered = [
+                r for r in rows
+                if text_match(r.get("storage_location"), args.location, False)
+                and text_match(r.get("name"), getattr(args, "name", None), bool(getattr(args, "exact", False)))
+            ]
+            card_id_filter = getattr(args, "card_id", None)
+            if card_id_filter is not None:
+                storage_filtered = [
+                    r for r in storage_filtered
+                    if r.get("resolved_card_id") == card_id_filter or r.get("card_id") == card_id_filter
+                ]
+            report = {
+                "storage_location": args.location,
+                "total_entry_rows": len(storage_filtered),
+                "total_copies": sum(r["quantity"] for r in storage_filtered),
+                "unique_card_names": len({r["name"] for r in storage_filtered}),
+                "entries": storage_filtered,
+            }
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(render_storage_report(report, args.limit))
+        return 0
+
+    if args.command == "where":
+        # Resolve the card name: positional card_name takes precedence over --name
+        name_query = getattr(args, "card_name", None) or getattr(args, "name", None)
+        card_id_filter = getattr(args, "card_id", None)
+        exact = bool(getattr(args, "exact", False))
+        if not name_query and card_id_filter is None:
+            print("Error: provide a card name (positional) or --name / --card-id", flush=True)
+            return 2
+        where_rows = [
+            r for r in rows
+            if (card_id_filter is None or r.get("resolved_card_id") == card_id_filter or r.get("card_id") == card_id_filter)
+            and (name_query is None or text_match(r.get("name"), name_query, exact))
+        ]
+        payload = build_where_report(where_rows)
+        if not payload["name"] and name_query:
+            payload["name"] = name_query
+        print(json.dumps(payload, indent=2) if args.json else render_where(payload))
         return 0
 
     parser.error(f"Unknown command: {args.command}")
